@@ -1,0 +1,153 @@
+import argparse
+import sys
+import time
+import cv2
+import mediapipe as mp
+import requests
+
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from utils import visualize
+
+# ================== NODEMCU CONFIG ==================
+NODEMCU_IP = "10.223.198.92"
+# ====================================================
+
+# ================== ESP32 CAM STREAM =================
+ESP32_CAM_URL = "http://10.223.198.103:81/stream"   # Change to your ESP32-CAM IP
+# ====================================================
+
+COUNTER, FPS = 0, 0
+START_TIME = time.time()
+
+last_state = "no_coconut"
+
+
+def send_coconut_signal():
+    try:
+        requests.get(f"http://{NODEMCU_IP}/coconut?value=1", timeout=0.3)
+        print("🥥 COCONUT SIGNAL SENT")
+    except:
+        print("⚠️ NodeMCU not reachable")
+
+
+def run(model: str, max_results: int, score_threshold: float):
+
+    global last_state
+
+    # OPEN ESP32-CAM STREAM
+    cap = cv2.VideoCapture(ESP32_CAM_URL)
+
+    row_size = 50
+    left_margin = 24
+    text_color = (0, 0, 0)
+    font_size = 1
+    font_thickness = 1
+    fps_avg_frame_count = 10
+
+    detection_frame = None
+    detection_result_list = []
+
+    def save_result(result, unused_output_image, timestamp_ms):
+        global FPS, COUNTER, START_TIME
+
+        if COUNTER % fps_avg_frame_count == 0:
+            FPS = fps_avg_frame_count / (time.time() - START_TIME)
+            START_TIME = time.time()
+
+        detection_result_list.append(result)
+        COUNTER += 1
+
+    base_options = python.BaseOptions(model_asset_path=model)
+
+    options = vision.ObjectDetectorOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.LIVE_STREAM,
+        max_results=max_results,
+        score_threshold=score_threshold,
+        result_callback=save_result
+    )
+
+    detector = vision.ObjectDetector.create_from_options(options)
+
+    timestamp_ms = 0
+
+    while True:
+
+        success, image = cap.read()
+
+        if not success:
+            print("⚠️ ESP32-CAM frame not received")
+            continue
+
+        image = cv2.resize(image, (640, 480))
+
+        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
+
+        timestamp_ms += 33
+        detector.detect_async(mp_image, timestamp_ms)
+
+        cv2.putText(image, f"FPS = {FPS:.1f}", (left_margin, row_size),
+                    cv2.FONT_HERSHEY_DUPLEX, font_size,
+                    text_color, font_thickness)
+
+        current_state = last_state
+
+        if detection_result_list:
+
+            result = detection_result_list.pop(0)
+
+            coconut_detected = False
+            filtered_detections = []
+
+            for detection in result.detections:
+
+                label = detection.categories[0].category_name.lower()
+                score = detection.categories[0].score
+
+                if label in ["mature_coconut", "overmature_coconut"] and score >= 0.85:
+                    coconut_detected = True
+                    filtered_detections.append(detection)
+
+            result.detections = filtered_detections
+
+            detection_frame = visualize(image, result)
+
+            current_state = "coconut" if coconut_detected else "no_coconut"
+
+        if current_state == "coconut" and last_state != "coconut":
+            send_coconut_signal()
+
+        last_state = current_state
+
+        if detection_frame is not None:
+            cv2.imshow("Coconut Detection", detection_frame)
+        else:
+            cv2.imshow("Coconut Detection", image)
+
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+    detector.close()
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+def main():
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--model', default='coconut.tflite')
+    parser.add_argument('--maxResults', default=5)
+    parser.add_argument('--scoreThreshold', type=float, default=0.75)
+
+    args = parser.parse_args()
+
+    run(args.model,
+        int(args.maxResults),
+        args.scoreThreshold)
+
+
+if __name__ == '__main__':
+    main()
